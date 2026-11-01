@@ -4,13 +4,10 @@ set -Eeuo pipefail
 interface="${AWG_INTERFACE:-awg0}"
 config="${AWG_CONFIG_FILE:-/etc/amnezia/amneziawg/awg0.conf}"
 address="${AWG_ADDRESS:-10.77.0.1/24}"
-radio_lan="${RADIO_LAN:-192.168.66.0/24}"
-module_lan="${MODULE_LAN:-192.168.55.0/24}"
 socket="/run/amneziawg/${interface}.sock"
 awg_pid=""
 interface_created=false
-radio_route_added=false
-module_route_added=false
+route_added=()
 
 if [[ ! -r "$config" ]]; then
     printf 'AmneziaWG config is missing or unreadable: %s\n' "$config" >&2
@@ -38,12 +35,9 @@ cleanup() {
     local exit_code=$?
     trap - EXIT INT TERM
 
-    if [[ "$radio_route_added" == true ]]; then
-        ip route del "$radio_lan" dev "$interface" 2>/dev/null || true
-    fi
-    if [[ "$module_route_added" == true ]]; then
-        ip route del "$module_lan" dev "$interface" 2>/dev/null || true
-    fi
+    for route in "${route_added[@]}"; do
+        ip route del "$route" dev "$interface" 2>/dev/null || true
+    done
     if [[ "$interface_created" == true ]]; then
         ip link del dev "$interface" 2>/dev/null || true
     fi
@@ -82,12 +76,26 @@ interface_created=true
 awg setconf "$interface" <(awg-quick strip "$config")
 ip address add "$address" dev "$interface"
 ip link set mtu 1420 up dev "$interface"
-ip route add "$radio_lan" dev "$interface"
-radio_route_added=true
-ip route add "$module_lan" dev "$interface"
-module_route_added=true
+while IFS= read -r route; do
+    [[ -n "$route" ]] || continue
+    ip route add "$route" dev "$interface"
+    route_added+=("$route")
+done < <(
+    awk '
+        /^\[Peer\]/ { in_peer = 1; next }
+        /^\[/ { in_peer = 0 }
+        in_peer && /^[[:space:]]*AllowedIPs[[:space:]]*=/ {
+            sub(/^[^=]*=[[:space:]]*/, "")
+            sub(/[[:space:]]*#.*/, "")
+            count = split($0, networks, ",")
+            for (i = 1; i <= count; i++) {
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", networks[i])
+                if (networks[i] != "") print networks[i]
+            }
+        }
+    ' "$config" | sort -u
+)
 
-printf 'AmneziaWG gateway is ready on %s; routes installed for %s and %s.\n' \
-    "$interface" "$radio_lan" "$module_lan"
+printf 'AmneziaWG gateway is ready on %s; routes installed for all peer AllowedIPs.\n' "$interface"
 
 wait "$awg_pid"

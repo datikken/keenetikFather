@@ -43,8 +43,6 @@ RUN chmod 0755 /usr/local/bin/entrypoint.sh
 
 ENV AWG_INTERFACE=awg0 \
     AWG_CONFIG_FILE=/etc/amnezia/amneziawg/awg0.conf \
-    AWG_ADDRESS=10.77.0.1/24 \
-    RADIO_LAN=192.168.66.0/24 \
-    MODULE_LAN=192.168.55.0/24
+    AWG_ADDRESS=10.77.0.1/24
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

@@ -1,5 +1,9 @@
 .git
 .env
 config/server.conf
+config/radio-peer.conf
+config/module-peer.conf
+config/pairs/
 *.key
+*.private
 *.private
