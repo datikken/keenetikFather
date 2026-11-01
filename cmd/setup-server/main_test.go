@@ -4,8 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPromptSetupUsesDefaultLANs(t *testing.T) {
@@ -77,6 +80,71 @@ func TestIsPublicIPv4(t *testing.T) {
 		if isPublicIPv4(net.ParseIP(value).To4()) {
 			t.Errorf("%s should be rejected", value)
 		}
+	}
+}
+
+func TestArchiveExistingConfigMovesServerAndAllPeerProfiles(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "config")
+	pairsDir := filepath.Join(configDir, "pairs")
+	if err := os.MkdirAll(filepath.Join(pairsDir, "old-pair"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		filepath.Join(configDir, "server.conf"):            "old server private key",
+		filepath.Join(configDir, "radio-peer.conf"):        "old radio private key",
+		filepath.Join(configDir, "module-peer.conf"):       "old module private key",
+		filepath.Join(pairsDir, "old-pair", "radio.conf"):  "old pair radio private key",
+		filepath.Join(pairsDir, "old-pair", "module.conf"): "old pair module private key",
+	}
+	for path, content := range files {
+		if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	now := time.Date(2026, 11, 1, 20, 0, 0, 0, time.UTC)
+	backupPath, err := archiveExistingConfig(root, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backupPath == "" {
+		t.Fatal("expected backup path")
+	}
+	for path, expected := range map[string]string{
+		filepath.Join(backupPath, "server.conf"):                      files[filepath.Join(configDir, "server.conf")],
+		filepath.Join(backupPath, "radio-peer.conf"):                  files[filepath.Join(configDir, "radio-peer.conf")],
+		filepath.Join(backupPath, "module-peer.conf"):                 files[filepath.Join(configDir, "module-peer.conf")],
+		filepath.Join(backupPath, "pairs", "old-pair", "radio.conf"):  files[filepath.Join(pairsDir, "old-pair", "radio.conf")],
+		filepath.Join(backupPath, "pairs", "old-pair", "module.conf"): files[filepath.Join(pairsDir, "old-pair", "module.conf")],
+	} {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read backup %s: %v", path, err)
+		}
+		if string(content) != expected {
+			t.Errorf("backup %s = %q, want %q", path, content, expected)
+		}
+	}
+	for _, path := range []string{
+		filepath.Join(configDir, "server.conf"),
+		filepath.Join(configDir, "radio-peer.conf"),
+		filepath.Join(configDir, "module-peer.conf"),
+		pairsDir,
+	} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Errorf("old config path %s still exists", path)
+		}
+	}
+}
+
+func TestArchiveExistingConfigDoesNothingWhenNoConfigExists(t *testing.T) {
+	backupPath, err := archiveExistingConfig(t.TempDir(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backupPath != "" {
+		t.Fatalf("backup path = %q, want empty", backupPath)
 	}
 }
 

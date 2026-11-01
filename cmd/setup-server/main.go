@@ -20,6 +20,7 @@ const (
 	serverListenPort = 51820
 	firstPairName    = "first"
 	imageName        = "crsf2-amneziawg:local"
+	backupDirName    = "setup-backups"
 )
 
 type setupInput struct {
@@ -45,33 +46,10 @@ func runSetup(input io.Reader, output io.Writer) error {
 	}
 
 	serverConfigPath := filepath.Join(root, "config", "server.conf")
-	firstPairPath := filepath.Join(root, "config", "pairs", firstPairName)
-	configExists := fileExists(serverConfigPath)
-	pairExists := fileExists(firstPairPath)
-
-	if configExists && pairExists {
-		for _, profile := range []string{"radio.conf", "module.conf"} {
-			if !fileExists(filepath.Join(firstPairPath, profile)) {
-				return fmt.Errorf("не найден профиль первой пары %s", filepath.Join(firstPairPath, profile))
-			}
-		}
-		fmt.Fprintln(output, "Настройка первой пары уже существует. Запускаю сервер с текущей конфигурацией.")
-		return startAndVerify(root, output)
-	}
-	if pairExists && !configExists {
-		return errors.New("найдены профили первой пары, но config/server.conf отсутствует; восстановите конфигурацию сервера")
-	}
-
-	var configText string
-	if configExists {
-		configTextBytes, err := os.ReadFile(serverConfigPath)
-		if err != nil {
-			return fmt.Errorf("прочитать config/server.conf: %w", err)
-		}
-		configText = string(configTextBytes)
-		if hasPeerSections(configText) {
-			return errors.New("config/server.conf уже содержит peers, но профили первой пары не найдены; не буду перезаписывать конфигурацию")
-		}
+	configDir := filepath.Dir(serverConfigPath)
+	lockPath := filepath.Join(configDir, ".add-pair.lock")
+	if fileExists(lockPath) {
+		return errors.New("обнаружен config/.add-pair.lock: дождитесь завершения добавления пары и запустите настройку снова")
 	}
 
 	values, err := promptSetup(input, output)
@@ -84,20 +62,29 @@ func runSetup(input io.Reader, output io.Writer) error {
 		return fmt.Errorf("сборка Docker-образа: %w", err)
 	}
 
-	if !configExists {
-		fmt.Fprintln(output, "\nСоздаю ключ сервера...")
-		serverPrivateKey, err := commandOutput(root, "docker", "run", "--rm", "--network", "none",
-			"--entrypoint", "awg", imageName, "genkey")
-		if err != nil {
-			return fmt.Errorf("генерация ключа сервера: %w", err)
-		}
-		if !isAWGKey(serverPrivateKey) {
-			return errors.New("awg вернул некорректный ключ сервера")
-		}
-		configText = initialServerConfig(serverPrivateKey)
-		if err := writePrivateFile(serverConfigPath, configText); err != nil {
-			return fmt.Errorf("создание config/server.conf: %w", err)
-		}
+	if err := stopExistingService(root, output); err != nil {
+		return fmt.Errorf("остановка существующего сервера: %w", err)
+	}
+	backupPath, err := archiveExistingConfig(root, time.Now())
+	if err != nil {
+		return fmt.Errorf("резервное копирование старой конфигурации: %w", err)
+	}
+	if backupPath != "" {
+		fmt.Fprintf(output, "\nСтарая конфигурация сохранена в %s\n", backupPath)
+		fmt.Fprintln(output, "Создаю новую конфигурацию с нуля...")
+	}
+
+	fmt.Fprintln(output, "\nСоздаю ключ сервера...")
+	serverPrivateKey, err := commandOutput(root, "docker", "run", "--rm", "--network", "none",
+		"--entrypoint", "awg", imageName, "genkey")
+	if err != nil {
+		return fmt.Errorf("генерация ключа сервера: %w", err)
+	}
+	if !isAWGKey(serverPrivateKey) {
+		return errors.New("awg вернул некорректный ключ сервера")
+	}
+	if err := writePrivateFile(serverConfigPath, initialServerConfig(serverPrivateKey)); err != nil {
+		return fmt.Errorf("создание config/server.conf: %w", err)
 	}
 
 	fmt.Fprintln(output, "\nСоздаю клиентские профили Radio и Module...")
@@ -107,7 +94,7 @@ func runSetup(input io.Reader, output io.Writer) error {
 	}
 
 	fmt.Fprintln(output, "\nЗапускаю сервер...")
-	if err := runInteractive(root, output, "docker", "compose", "up", "-d"); err != nil {
+	if err := runInteractive(root, output, "docker", "compose", "up", "-d", "--force-recreate"); err != nil {
 		return fmt.Errorf("запуск сервера: %w", err)
 	}
 	if err := waitUntilHealthy(root); err != nil {
@@ -175,15 +162,6 @@ func isPublicIPv4(ip net.IP) bool {
 		!ip.IsMulticast() &&
 		!ip.IsLinkLocalUnicast() &&
 		!ip.IsLinkLocalMulticast()
-}
-
-func hasPeerSections(configText string) bool {
-	for _, line := range strings.Split(configText, "\n") {
-		if strings.TrimSpace(line) == "[Peer]" {
-			return true
-		}
-	}
-	return false
 }
 
 func networksOverlap(first, second net.IPNet) bool {
@@ -320,15 +298,54 @@ func runInteractive(root string, output io.Writer, name string, args ...string) 
 	return nil
 }
 
-func startAndVerify(root string, output io.Writer) error {
-	if err := runInteractive(root, output, "docker", "compose", "up", "-d"); err != nil {
-		return fmt.Errorf("запуск существующей конфигурации: %w", err)
-	}
-	if err := waitUntilHealthy(root); err != nil {
+func stopExistingService(root string, output io.Writer) error {
+	containerID, err := commandOutput(root, "docker", "compose", "ps", "-q", "amneziawg")
+	if err != nil {
 		return err
 	}
-	fmt.Fprintln(output, "Сервер запущен и прошёл healthcheck.")
-	return nil
+	if containerID == "" {
+		return nil
+	}
+	fmt.Fprintln(output, "\nОстанавливаю существующий сервер перед сбросом...")
+	return runInteractive(root, output, "docker", "compose", "stop", "amneziawg")
+}
+
+func archiveExistingConfig(root string, now time.Time) (string, error) {
+	configDir := filepath.Join(root, "config")
+	backupRoot := filepath.Join(configDir, backupDirName)
+	paths := []string{
+		filepath.Join(configDir, "server.conf"),
+		filepath.Join(configDir, "radio-peer.conf"),
+		filepath.Join(configDir, "module-peer.conf"),
+		filepath.Join(configDir, "pairs"),
+	}
+	var existing []string
+	for _, path := range paths {
+		if _, err := os.Lstat(path); err == nil {
+			existing = append(existing, path)
+		} else if !os.IsNotExist(err) {
+			return "", fmt.Errorf("проверить %s: %w", path, err)
+		}
+	}
+	if len(existing) == 0 {
+		return "", nil
+	}
+	if err := os.MkdirAll(backupRoot, 0700); err != nil {
+		return "", fmt.Errorf("создать каталог резервных копий: %w", err)
+	}
+	if err := os.Chmod(backupRoot, 0700); err != nil {
+		return "", fmt.Errorf("ограничить доступ к резервным копиям: %w", err)
+	}
+	backupPath := filepath.Join(backupRoot, now.Format("20060102-150405.000000000"))
+	if err := os.Mkdir(backupPath, 0700); err != nil {
+		return "", fmt.Errorf("создать резервную копию %s: %w", backupPath, err)
+	}
+	for _, path := range existing {
+		if err := os.Rename(path, filepath.Join(backupPath, filepath.Base(path))); err != nil {
+			return backupPath, fmt.Errorf("переместить %s в резервную копию %s: %w", path, backupPath, err)
+		}
+	}
+	return backupPath, nil
 }
 
 func waitUntilHealthy(root string) error {
