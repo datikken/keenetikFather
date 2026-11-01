@@ -303,6 +303,26 @@ func TestInitialServerConfigUsesSelectedUDPPort(t *testing.T) {
 	}
 }
 
+func TestPrintClientProfileDownloadCommandsUsesEnteredServerIPAndProjectPath(t *testing.T) {
+	root := filepath.Join(string(filepath.Separator), "root", "Documents", "keenetikFather")
+	var output bytes.Buffer
+	wizard := setupWizard{
+		root:   root,
+		output: &output,
+	}
+
+	wizard.printClientProfileDownloadCommands("185.219.43.239")
+
+	for _, expected := range []string{
+		"scp root@185.219.43.239:/root/Documents/keenetikFather/config/pairs/first/radio.conf C:\\Users\\Motor\\Documents\\kentucky",
+		"scp root@185.219.43.239:/root/Documents/keenetikFather/config/pairs/first/module.conf C:\\Users\\Motor\\Documents\\kentucky",
+	} {
+		if !strings.Contains(output.String(), expected) {
+			t.Errorf("output missing %q:\n%s", expected, output.String())
+		}
+	}
+}
+
 func bufioReader(value string) *bufio.Reader {
 	return bufio.NewReader(strings.NewReader(value))
 }

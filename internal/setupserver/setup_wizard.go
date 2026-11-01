@@ -101,5 +101,15 @@ func (wizard setupWizard) run() error {
 	fmt.Fprintf(wizard.output, "Публичный endpoint: %s\n", values.endpoint)
 	fmt.Fprintf(wizard.output, "Профили созданы в config/pairs/%s/.\n", firstPairName)
 	fmt.Fprintln(wizard.output, "Передайте radio.conf шлюзу Radio, а module.conf — шлюзу Module.")
+	wizard.printClientProfileDownloadCommands(values.serverIP)
 	return nil
+}
+
+func (wizard setupWizard) printClientProfileDownloadCommands(serverIP string) {
+	profileDirectory := filepath.ToSlash(filepath.Join(wizard.root, "config", "pairs", firstPairName))
+	fmt.Fprintln(wizard.output, "\nВыполните эти команды в PowerShell на компьютере с клиентами:")
+	for _, profile := range []string{"radio.conf", "module.conf"} {
+		fmt.Fprintf(wizard.output, "scp root@%s:%s/%s C:\\Users\\Motor\\Documents\\kentucky\n",
+			serverIP, profileDirectory, profile)
+	}
 }

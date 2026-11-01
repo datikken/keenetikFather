@@ -12,6 +12,7 @@ import (
 )
 
 type setupInput struct {
+	serverIP   string
 	endpoint   string
 	serverPort int
 	radioLAN   net.IPNet
@@ -44,6 +45,7 @@ func promptSetup(input io.Reader, output io.Writer) (setupInput, error) {
 		return setupInput{}, fmt.Errorf("LAN-подсети не должны пересекаться с VPN-сетью %s", vpnNetwork)
 	}
 	return setupInput{
+		serverIP:   endpoint,
 		endpoint:   net.JoinHostPort(endpoint, strconv.Itoa(serverPort)),
 		serverPort: serverPort,
 		radioLAN:   radioLAN,
