@@ -1,0 +1,25 @@
+[Interface]
+Address = 10.77.0.1/24
+ListenPort = 51820
+PrivateKey = CHANGE_ME_SERVER_PRIVATE_KEY
+
+# These example AWG values must be copied to both peer configurations.
+Jc = 5
+Jmin = 10
+Jmax = 50
+S1 = 0
+S2 = 0
+H1 = 1
+H2 = 2
+H3 = 3
+H4 = 4
+
+[Peer]
+# Radio-side router/gateway
+PublicKey = CHANGE_ME_RADIO_PUBLIC_KEY
+AllowedIPs = 10.77.0.2/32, 192.168.66.0/24
+
+[Peer]
+# Module-side router/gateway
+PublicKey = CHANGE_ME_MODULE_PUBLIC_KEY
+AllowedIPs = 10.77.0.3/32, 192.168.55.0/24

@@ -1,0 +1,20 @@
+[Interface]
+Address = 10.77.0.3/32
+PrivateKey = CHANGE_ME_MODULE_PRIVATE_KEY
+MTU = 1420
+
+Jc = 5
+Jmin = 10
+Jmax = 50
+S1 = 0
+S2 = 0
+H1 = 1
+H2 = 2
+H3 = 3
+H4 = 4
+
+[Peer]
+PublicKey = CHANGE_ME_SERVER_PUBLIC_KEY
+Endpoint = CHANGE_ME_VDS_PUBLIC_IP:51820
+AllowedIPs = 10.77.0.0/24, 192.168.66.0/24
+PersistentKeepalive = 25

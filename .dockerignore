@@ -1,0 +1,5 @@
+.git
+.env
+config/server.conf
+*.key
+*.private
