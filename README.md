@@ -29,28 +29,25 @@ sudo sysctl --system
 
 Для временного включения можно выполнить `sudo sysctl -w net.ipv4.ip_forward=1`. Контейнер откажется запускаться, если forwarding выключен.
 
-## 2. Запустите шлюз
+## 2. Запустите шлюз и создайте первую пару
 
-Перед запуском создайте рабочие конфиги из шаблонов и замените все `CHANGE_ME_...` отдельными ключами сервера, Radio и Module:
-
-```sh
-docker compose build
-cp config/server.conf.example config/server.conf
-cp config/radio-peer.conf.example config/radio-peer.conf
-cp config/module-peer.conf.example config/module-peer.conf
-docker run --rm --entrypoint awg crsf2-amneziawg:local genkey
-```
-
-Сгенерируйте три независимых приватных ключа командой `genkey`, вычислите для каждого публичный через `printf '%s\n' 'ПРИВАТНЫЙ_КЛЮЧ' | docker run --rm -i --entrypoint awg crsf2-amneziawg:local pubkey` и внесите значения в соответствующие шаблоны. Укажите публичный IP или DNS VDS в `Endpoint` обоих клиентских профилей. Параметры AmneziaWG должны совпадать у сервера и клиентов.
-
-Файлы с приватными ключами исключены из Git и Docker build context; ограничьте к ним доступ (`chmod 600 config/server.conf config/radio-peer.conf config/module-peer.conf`) и храните их в безопасности.
+В Windows запустите `start-server.cmd` двойным щелчком или из командной строки. Он работает с Docker Engine, настроенным на этом компьютере; файл не подключается по SSH к удалённому VDS. Для этого проекта предпочтителен Linux VDS: подключитесь к нему, поместите каталог проекта на VDS и выполните там Go-команду. На Linux выполните из каталога проекта:
 
 ```sh
-docker compose config
-docker compose up -d --build
-docker compose ps
-docker compose logs --tail=100 amneziawg
+go run ./cmd/setup-server
 ```
+
+Мастер запросит только:
+
+1. Публичный IPv4-адрес этого сервера — он попадёт в `Endpoint` профилей клиентов; UDP-порт `51820` задан автоматически.
+2. LAN Radio в формате CIDR — Enter оставляет `192.168.66.0/24`.
+3. LAN Module в формате CIDR — Enter оставляет `192.168.55.0/24`.
+
+После ввода мастер соберёт Docker-образ, создаст ключ сервера и отдельные ключи Radio/Module, запишет конфигурацию, запустит шлюз и дождётся успешного healthcheck. Первая пара сохраняется в `config/pairs/first/radio.conf` и `config/pairs/first/module.conf`. Передавайте каждый профиль только соответствующему шлюзу. Если первый запуск прервётся после создания серверного конфига, повторный запуск продолжит настройку, не заменяя существующий ключ.
+
+Файлы с приватными ключами исключены из Git и Docker build context. На Linux они создаются с правами только для владельца; на Windows ограничьте доступ к каталогу проекта ACL-правилами.
+
+Для последующих запусков используйте `docker compose up -d`; для просмотра состояния и логов — `docker compose ps` и `docker compose logs --tail=100 amneziawg`.
 
 Контейнер создаёт userspace-интерфейс `awg0` и устанавливает маршруты для всех `AllowedIPs` из peer-записей. Используется host networking, поэтому секция `ports` отсутствует.
 

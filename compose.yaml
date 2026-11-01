@@ -20,7 +20,7 @@ services:
     environment:
       AWG_INTERFACE: awg0
       AWG_CONFIG_FILE: /etc/amnezia/amneziawg/awg0.conf
-      AWG_ADDRESS: ${AWG_ADDRESS:-10.77.0.1/24}
+      AWG_ADDRESS: 10.77.0.1/24
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "ip link show dev awg0 >/dev/null && awg show awg0 >/dev/null"]
