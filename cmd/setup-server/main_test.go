@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -71,12 +73,15 @@ func TestParseLANRejectsDeviceAddress(t *testing.T) {
 }
 
 func TestIsPublicIPv4(t *testing.T) {
-	for _, value := range []string{"8.8.8.8", "203.0.113.10"} {
+	for _, value := range []string{"8.8.8.8", "1.1.1.1"} {
 		if !isPublicIPv4(net.ParseIP(value).To4()) {
 			t.Errorf("%s should be accepted by public IPv4 check", value)
 		}
 	}
-	for _, value := range []string{"127.0.0.1", "192.168.1.1", "0.0.0.0"} {
+	for _, value := range []string{
+		"127.0.0.1", "192.168.1.1", "0.0.0.0",
+		"100.64.0.1", "192.0.2.1", "198.18.0.1", "203.0.113.10", "240.0.0.1",
+	} {
 		if isPublicIPv4(net.ParseIP(value).To4()) {
 			t.Errorf("%s should be rejected", value)
 		}
@@ -132,7 +137,7 @@ func TestArchiveExistingConfigMovesServerAndAllPeerProfiles(t *testing.T) {
 		filepath.Join(configDir, "module-peer.conf"),
 		pairsDir,
 	} {
-		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
 			t.Errorf("old config path %s still exists", path)
 		}
 	}
@@ -145,6 +150,61 @@ func TestArchiveExistingConfigDoesNothingWhenNoConfigExists(t *testing.T) {
 	}
 	if backupPath != "" {
 		t.Fatalf("backup path = %q, want empty", backupPath)
+	}
+}
+
+func TestArchiveExistingConfigPreservesSourceWhenBackupAlreadyExists(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config", "server.conf")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte("existing config"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 11, 1, 20, 0, 0, 0, time.UTC)
+	backupPath := filepath.Join(root, "config", backupDirName, now.Format("20060102-150405.000000000"))
+	if err := os.MkdirAll(backupPath, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := archiveExistingConfig(root, now); err == nil {
+		t.Fatal("expected a conflicting backup directory to fail")
+	}
+	content, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "existing config" {
+		t.Fatalf("source config = %q, want it to remain untouched", content)
+	}
+}
+
+func TestWritePrivateFileDoesNotOverwriteExistingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "server.conf")
+	if err := os.WriteFile(path, []byte("existing config"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := writePrivateFile(path, "replacement config")
+	if err == nil {
+		t.Fatal("expected an existing private file to be preserved")
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "existing config" {
+		t.Fatalf("file content = %q, want existing config", content)
+	}
+}
+
+func TestWaitForNextPollReturnsWhenContextIsCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := waitForNextPoll(ctx, time.Hour); !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitForNextPoll error = %v, want %v", err, context.Canceled)
 	}
 }
 

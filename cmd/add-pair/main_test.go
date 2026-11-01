@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"net"
 	"strings"
 	"testing"
+	"time"
 )
 
 const testServerConfig = `[Interface]
@@ -95,5 +97,14 @@ func TestClientProfileIncludesPeerRouteAndParameters(t *testing.T) {
 		if !strings.Contains(profile, expected) {
 			t.Errorf("profile missing %q:\n%s", expected, profile)
 		}
+	}
+}
+
+func TestWaitForNextPollReturnsWhenContextIsCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := waitForNextPoll(ctx, time.Hour); err != context.Canceled {
+		t.Fatalf("waitForNextPoll error = %v, want %v", err, context.Canceled)
 	}
 }

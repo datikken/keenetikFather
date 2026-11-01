@@ -2,12 +2,14 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"time"
@@ -30,13 +32,21 @@ type setupInput struct {
 }
 
 func main() {
-	if err := runSetup(os.Stdin, os.Stdout); err != nil {
-		fmt.Fprintln(os.Stderr, "Ошибка:", err)
-		os.Exit(1)
-	}
+	os.Exit(run())
 }
 
-func runSetup(input io.Reader, output io.Writer) error {
+func run() int {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	if err := runSetup(ctx, os.Stdin, os.Stdout); err != nil {
+		fmt.Fprintln(os.Stderr, "Ошибка:", err)
+		return 1
+	}
+	return 0
+}
+
+func runSetup(ctx context.Context, input io.Reader, output io.Writer) error {
 	root, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("определить каталог проекта: %w", err)
@@ -48,7 +58,11 @@ func runSetup(input io.Reader, output io.Writer) error {
 	serverConfigPath := filepath.Join(root, "config", "server.conf")
 	configDir := filepath.Dir(serverConfigPath)
 	lockPath := filepath.Join(configDir, ".add-pair.lock")
-	if fileExists(lockPath) {
+	lockExists, err := fileExists(lockPath)
+	if err != nil {
+		return fmt.Errorf("проверить блокировку добавления пары: %w", err)
+	}
+	if lockExists {
 		return errors.New("обнаружен config/.add-pair.lock: дождитесь завершения добавления пары и запустите настройку снова")
 	}
 
@@ -58,11 +72,14 @@ func runSetup(input io.Reader, output io.Writer) error {
 	}
 
 	fmt.Fprintln(output, "\nСобираю Docker-образ...")
-	if err := runInteractive(root, output, "docker", "compose", "build"); err != nil {
+	if err := runInteractive(ctx, root, output, "docker", "compose", "build"); err != nil {
 		return fmt.Errorf("сборка Docker-образа: %w", err)
 	}
 
-	if err := stopExistingService(root, output); err != nil {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := stopExistingService(ctx, root, output); err != nil {
 		return fmt.Errorf("остановка существующего сервера: %w", err)
 	}
 	backupPath, err := archiveExistingConfig(root, time.Now())
@@ -75,7 +92,7 @@ func runSetup(input io.Reader, output io.Writer) error {
 	}
 
 	fmt.Fprintln(output, "\nСоздаю ключ сервера...")
-	serverPrivateKey, err := commandOutput(root, "docker", "run", "--rm", "--network", "none",
+	serverPrivateKey, err := commandOutput(ctx, root, "docker", "run", "--rm", "--network", "none",
 		"--entrypoint", "awg", imageName, "genkey")
 	if err != nil {
 		return fmt.Errorf("генерация ключа сервера: %w", err)
@@ -88,16 +105,16 @@ func runSetup(input io.Reader, output io.Writer) error {
 	}
 
 	fmt.Fprintln(output, "\nСоздаю клиентские профили Radio и Module...")
-	if err := runInteractive(root, output, "go", "run", "./cmd/add-pair", firstPairName,
+	if err := runInteractive(ctx, root, output, "go", "run", "./cmd/add-pair", firstPairName,
 		values.radioLAN.String(), values.moduleLAN.String(), values.endpoint); err != nil {
 		return fmt.Errorf("создание первой пары: %w", err)
 	}
 
 	fmt.Fprintln(output, "\nЗапускаю сервер...")
-	if err := runInteractive(root, output, "docker", "compose", "up", "-d", "--force-recreate"); err != nil {
+	if err := runInteractive(ctx, root, output, "docker", "compose", "up", "-d", "--force-recreate"); err != nil {
 		return fmt.Errorf("запуск сервера: %w", err)
 	}
-	if err := waitUntilHealthy(root); err != nil {
+	if err := waitUntilHealthy(ctx, root); err != nil {
 		return err
 	}
 
@@ -155,13 +172,31 @@ func promptPublicIPv4(reader *bufio.Reader, output io.Writer) (string, error) {
 }
 
 func isPublicIPv4(ip net.IP) bool {
-	return ip != nil &&
-		!ip.IsPrivate() &&
-		!ip.IsLoopback() &&
-		!ip.IsUnspecified() &&
-		!ip.IsMulticast() &&
-		!ip.IsLinkLocalUnicast() &&
-		!ip.IsLinkLocalMulticast()
+	if ip == nil || ip.To4() == nil || !ip.IsGlobalUnicast() ||
+		ip.IsPrivate() || ip.IsLoopback() || ip.IsUnspecified() ||
+		ip.IsMulticast() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return false
+	}
+
+	for _, block := range []string{
+		"100.64.0.0/10",
+		"192.0.0.0/24",
+		"192.0.2.0/24",
+		"192.88.99.0/24",
+		"198.18.0.0/15",
+		"198.51.100.0/24",
+		"203.0.113.0/24",
+		"240.0.0.0/4",
+	} {
+		_, network, err := net.ParseCIDR(block)
+		if err != nil {
+			return false
+		}
+		if network.Contains(ip) {
+			return false
+		}
+	}
+	return true
 }
 
 func networksOverlap(first, second net.IPNet) bool {
@@ -238,68 +273,85 @@ func isAWGKey(value string) bool {
 	return true
 }
 
-func writePrivateFile(path, contents string) error {
+func writePrivateFile(path, contents string) (returnErr error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return err
+		return fmt.Errorf("create config directory: %w", err)
 	}
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
-		if os.IsExist(err) {
+		if errors.Is(err, os.ErrExist) {
 			return fmt.Errorf("%s уже существует; отказываюсь его перезаписывать", path)
 		}
 		return err
 	}
+	closed := false
+	committed := false
+	defer func() {
+		if !closed {
+			if err := file.Close(); err != nil {
+				returnErr = errors.Join(returnErr, fmt.Errorf("close private file: %w", err))
+			}
+		}
+		if !committed {
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				returnErr = errors.Join(returnErr, fmt.Errorf("remove incomplete private file: %w", err))
+			}
+		}
+	}()
+	if err := file.Chmod(0600); err != nil {
+		return fmt.Errorf("set private file permissions: %w", err)
+	}
 	if _, err := file.WriteString(contents); err != nil {
-		file.Close()
-		os.Remove(path)
-		return err
+		return fmt.Errorf("write private file: %w", err)
 	}
 	if err := file.Sync(); err != nil {
-		file.Close()
-		os.Remove(path)
-		return err
+		return fmt.Errorf("sync private file: %w", err)
 	}
 	if err := file.Close(); err != nil {
-		os.Remove(path)
-		return err
+		closed = true
+		return fmt.Errorf("close private file: %w", err)
 	}
-	if err := os.Chmod(path, 0600); err != nil {
-		os.Remove(path)
-		return err
-	}
+	closed = true
+	committed = true
 	return nil
 }
 
-func commandOutput(root, name string, args ...string) (string, error) {
-	command := exec.Command(name, args...)
+func commandOutput(ctx context.Context, root, name string, args ...string) (string, error) {
+	command := exec.CommandContext(ctx, name, args...)
 	command.Dir = root
 	var stdout strings.Builder
 	var stderr strings.Builder
 	command.Stdout = &stdout
 	command.Stderr = &stderr
 	if err := command.Run(); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", fmt.Errorf("%s canceled: %w", name, ctxErr)
+		}
 		detail := strings.TrimSpace(stderr.String())
 		if detail == "" {
 			detail = err.Error()
 		}
-		return "", fmt.Errorf("%s: %s", name, detail)
+		return "", fmt.Errorf("%s: %s: %w", name, detail, err)
 	}
 	return strings.TrimSpace(stdout.String()), nil
 }
 
-func runInteractive(root string, output io.Writer, name string, args ...string) error {
-	command := exec.Command(name, args...)
+func runInteractive(ctx context.Context, root string, output io.Writer, name string, args ...string) error {
+	command := exec.CommandContext(ctx, name, args...)
 	command.Dir = root
 	command.Stdout = output
 	command.Stderr = output
 	if err := command.Run(); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("%s canceled: %w", name, ctxErr)
+		}
 		return fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
 	}
 	return nil
 }
 
-func stopExistingService(root string, output io.Writer) error {
-	containerID, err := commandOutput(root, "docker", "compose", "ps", "-q", "amneziawg")
+func stopExistingService(ctx context.Context, root string, output io.Writer) error {
+	containerID, err := commandOutput(ctx, root, "docker", "compose", "ps", "-q", "amneziawg")
 	if err != nil {
 		return err
 	}
@@ -307,10 +359,10 @@ func stopExistingService(root string, output io.Writer) error {
 		return nil
 	}
 	fmt.Fprintln(output, "\nОстанавливаю существующий сервер перед сбросом...")
-	return runInteractive(root, output, "docker", "compose", "stop", "amneziawg")
+	return runInteractive(ctx, root, output, "docker", "compose", "stop", "amneziawg")
 }
 
-func archiveExistingConfig(root string, now time.Time) (string, error) {
+func archiveExistingConfig(root string, now time.Time) (backupPath string, returnErr error) {
 	configDir := filepath.Join(root, "config")
 	backupRoot := filepath.Join(configDir, backupDirName)
 	paths := []string{
@@ -323,7 +375,7 @@ func archiveExistingConfig(root string, now time.Time) (string, error) {
 	for _, path := range paths {
 		if _, err := os.Lstat(path); err == nil {
 			existing = append(existing, path)
-		} else if !os.IsNotExist(err) {
+		} else if !errors.Is(err, os.ErrNotExist) {
 			return "", fmt.Errorf("проверить %s: %w", path, err)
 		}
 	}
@@ -336,20 +388,38 @@ func archiveExistingConfig(root string, now time.Time) (string, error) {
 	if err := os.Chmod(backupRoot, 0700); err != nil {
 		return "", fmt.Errorf("ограничить доступ к резервным копиям: %w", err)
 	}
-	backupPath := filepath.Join(backupRoot, now.Format("20060102-150405.000000000"))
+	backupPath = filepath.Join(backupRoot, now.Format("20060102-150405.000000000"))
 	if err := os.Mkdir(backupPath, 0700); err != nil {
 		return "", fmt.Errorf("создать резервную копию %s: %w", backupPath, err)
 	}
+	type movedPath struct {
+		source string
+		target string
+	}
+	var moved []movedPath
 	for _, path := range existing {
-		if err := os.Rename(path, filepath.Join(backupPath, filepath.Base(path))); err != nil {
-			return backupPath, fmt.Errorf("переместить %s в резервную копию %s: %w", path, backupPath, err)
+		target := filepath.Join(backupPath, filepath.Base(path))
+		if err := os.Rename(path, target); err != nil {
+			returnErr = fmt.Errorf("переместить %s в резервную копию %s: %w", path, backupPath, err)
+			for index := len(moved) - 1; index >= 0; index-- {
+				if rollbackErr := os.Rename(moved[index].target, moved[index].source); rollbackErr != nil {
+					returnErr = errors.Join(returnErr, fmt.Errorf("восстановить %s: %w", moved[index].source, rollbackErr))
+				}
+			}
+			if err := os.Remove(backupPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				returnErr = errors.Join(returnErr, fmt.Errorf("удалить неполную резервную копию %s: %w", backupPath, err))
+			}
+			if returnErr != nil {
+				return backupPath, returnErr
+			}
 		}
+		moved = append(moved, movedPath{source: path, target: target})
 	}
 	return backupPath, nil
 }
 
-func waitUntilHealthy(root string) error {
-	containerID, err := commandOutput(root, "docker", "compose", "ps", "-q", "amneziawg")
+func waitUntilHealthy(ctx context.Context, root string) error {
+	containerID, err := commandOutput(ctx, root, "docker", "compose", "ps", "-q", "amneziawg")
 	if err != nil {
 		return fmt.Errorf("получить состояние контейнера: %w", err)
 	}
@@ -357,7 +427,7 @@ func waitUntilHealthy(root string) error {
 		return errors.New("Docker Compose не создал контейнер amneziawg")
 	}
 	for range 90 {
-		status, err := commandOutput(root, "docker", "inspect", "--format",
+		status, err := commandOutput(ctx, root, "docker", "inspect", "--format",
 			"{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}", containerID)
 		if err != nil {
 			return fmt.Errorf("проверить состояние контейнера: %w", err)
@@ -366,19 +436,43 @@ func waitUntilHealthy(root string) error {
 			return nil
 		}
 		if strings.HasPrefix(status, "exited|") || strings.HasPrefix(status, "dead|") {
-			_ = runInteractive(root, os.Stderr, "docker", "compose", "logs", "--tail=50", "amneziawg")
-			return fmt.Errorf("сервер завершился со статусом %s; проверьте docker compose logs amneziawg", status)
+			return showFailureLogs(ctx, root, fmt.Errorf("сервер завершился со статусом %s; проверьте docker compose logs amneziawg", status))
 		}
 		if strings.HasSuffix(status, "|unhealthy") {
-			_ = runInteractive(root, os.Stderr, "docker", "compose", "logs", "--tail=50", "amneziawg")
-			return errors.New("сервер не прошёл healthcheck; проверьте docker compose logs amneziawg")
+			return showFailureLogs(ctx, root, errors.New("сервер не прошёл healthcheck; проверьте docker compose logs amneziawg"))
 		}
-		time.Sleep(time.Second)
+		if err := waitForNextPoll(ctx, time.Second); err != nil {
+			return err
+		}
 	}
 	return errors.New("таймаут ожидания healthcheck; проверьте docker compose ps и docker compose logs amneziawg")
 }
 
-func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
+func showFailureLogs(ctx context.Context, root string, cause error) error {
+	if err := runInteractive(ctx, root, os.Stderr, "docker", "compose", "logs", "--tail=50", "amneziawg"); err != nil {
+		return errors.Join(cause, fmt.Errorf("показать логи контейнера: %w", err))
+	}
+	return cause
+}
+
+func waitForNextPoll(ctx context.Context, interval time.Duration) error {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func fileExists(path string) (bool, error) {
+	_, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }

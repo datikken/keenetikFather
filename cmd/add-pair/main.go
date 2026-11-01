@@ -3,11 +3,13 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -16,6 +18,11 @@ import (
 )
 
 const imageName = "crsf2-amneziawg:local"
+
+var (
+	awgKeyPattern   = regexp.MustCompile(`^[A-Za-z0-9+/]{43}=$`)
+	pairNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,47}$`)
+)
 
 var awgParameters = []string{
 	"Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4",
@@ -270,106 +277,131 @@ func appendPeers(original, name, radioPublic string, radioIP net.IP, radioLAN ne
 			name, radioPublic, radioIP, &radioLAN, name, modulePublic, moduleIP, &moduleLAN)
 }
 
-func runCommand(input []byte, name string, args ...string) (string, error) {
-	command := exec.Command(name, args...)
-	command.Dir = projectRoot()
+func runCommand(ctx context.Context, input []byte, name string, args ...string) (string, error) {
+	command := exec.CommandContext(ctx, name, args...)
+	root, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("get project directory: %w", err)
+	}
+	command.Dir = root
 	command.Stdin = bytes.NewReader(input)
 	var stdout, stderr bytes.Buffer
 	command.Stdout = &stdout
 	command.Stderr = &stderr
 	if err := command.Run(); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", fmt.Errorf("command %s canceled: %w", name, ctxErr)
+		}
 		detail := strings.TrimSpace(stderr.String())
 		if detail == "" {
 			detail = err.Error()
 		}
-		return "", fmt.Errorf("command %s failed: %s", name, detail)
+		return "", fmt.Errorf("command %s failed: %s: %w", name, detail, err)
 	}
 	return strings.TrimSpace(stdout.String()), nil
 }
 
-func projectRoot() string {
-	root, err := os.Getwd()
-	if err != nil {
-		return "."
-	}
-	return root
-}
-
-func generateKey() (string, error) {
-	key, err := runCommand(nil, "docker", "compose", "run", "--rm", "--no-deps", "-T", "--entrypoint", "awg", "amneziawg", "genkey")
+func generateKey(ctx context.Context) (string, error) {
+	key, err := runCommand(ctx, nil, "docker", "compose", "run", "--rm", "--no-deps", "-T", "--entrypoint", "awg", "amneziawg", "genkey")
 	if err != nil {
 		return "", err
 	}
-	if !regexp.MustCompile(`^[A-Za-z0-9+/]{43}=$`).MatchString(key) {
+	if !awgKeyPattern.MatchString(key) {
 		return "", errors.New("awg returned an invalid private key")
 	}
 	return key, nil
 }
 
-func publicKey(privateKey string) (string, error) {
-	key, err := runCommand([]byte(privateKey+"\n"), "docker", "compose", "run", "--rm", "--no-deps", "-T", "--entrypoint", "awg", "amneziawg", "pubkey")
+func publicKey(ctx context.Context, privateKey string) (string, error) {
+	key, err := runCommand(ctx, []byte(privateKey+"\n"), "docker", "compose", "run", "--rm", "--no-deps", "-T", "--entrypoint", "awg", "amneziawg", "pubkey")
 	if err != nil {
 		return "", err
 	}
-	if !regexp.MustCompile(`^[A-Za-z0-9+/]{43}=$`).MatchString(key) {
+	if !awgKeyPattern.MatchString(key) {
 		return "", errors.New("awg returned an invalid public key")
 	}
 	return key, nil
 }
 
-func validateWithAWG(configPath string) error {
+func validateWithAWG(ctx context.Context, configPath string) error {
 	absolute, err := filepath.Abs(configPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("resolve config path: %w", err)
 	}
-	_, err = runCommand(nil, "docker", "run", "--rm", "--network", "none",
+	_, err = runCommand(ctx, nil, "docker", "run", "--rm", "--network", "none",
 		"--mount", fmt.Sprintf("type=bind,source=%s,target=/tmp/server.conf,readonly", absolute),
 		"--entrypoint", "bash", imageName, "-lc", "awg-quick strip /tmp/server.conf")
 	return err
 }
 
-func writeAtomic(path, contents string, mode os.FileMode) error {
+func writeAtomic(path, contents string, mode os.FileMode) (returnErr error) {
 	temporary, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
 	if err != nil {
-		return err
+		return fmt.Errorf("create temporary file: %w", err)
 	}
 	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
+	closed := false
+	defer func() {
+		if !closed {
+			if err := temporary.Close(); err != nil {
+				returnErr = errors.Join(returnErr, fmt.Errorf("close temporary file: %w", err))
+			}
+		}
+		if err := os.Remove(temporaryPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			returnErr = errors.Join(returnErr, fmt.Errorf("remove temporary file: %w", err))
+		}
+	}()
 	if err := temporary.Chmod(mode); err != nil {
-		temporary.Close()
-		return err
+		return fmt.Errorf("set temporary file permissions: %w", err)
 	}
 	if _, err := temporary.WriteString(contents); err != nil {
-		temporary.Close()
-		return err
+		return fmt.Errorf("write temporary file: %w", err)
 	}
 	if err := temporary.Sync(); err != nil {
-		temporary.Close()
-		return err
+		return fmt.Errorf("sync temporary file: %w", err)
 	}
 	if err := temporary.Close(); err != nil {
-		return err
+		closed = true
+		return fmt.Errorf("close temporary file: %w", err)
 	}
+	closed = true
 	return os.Rename(temporaryPath, path)
 }
 
-func addPair(options pairOptions) (string, error) {
-	root := projectRoot()
+func addPair(ctx context.Context, options pairOptions) (pairPath string, returnErr error) {
+	root, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("get project directory: %w", err)
+	}
 	configPath := filepath.Join(root, "config", "server.conf")
 	pairsDirectory := filepath.Join(root, "config", "pairs")
 	lockPath := filepath.Join(root, "config", ".add-pair.lock")
 	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
-		if os.IsExist(err) {
+		if errors.Is(err, os.ErrExist) {
 			return "", fmt.Errorf("another add-pair operation is active, or stale lock exists: %s", lockPath)
 		}
 		return "", fmt.Errorf("create lock file: %w", err)
 	}
-	fmt.Fprintf(lock, "pid=%d\n", os.Getpid())
-	lock.Close()
-	defer os.Remove(lockPath)
+	if _, err := fmt.Fprintf(lock, "pid=%d\n", os.Getpid()); err != nil {
+		returnErr = fmt.Errorf("write lock file: %w", err)
+	}
+	if err := lock.Close(); err != nil {
+		returnErr = errors.Join(returnErr, fmt.Errorf("close lock file: %w", err))
+	}
+	if returnErr != nil {
+		if err := os.Remove(lockPath); err != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("remove lock file: %w", err))
+		}
+		return "", returnErr
+	}
+	defer func() {
+		if err := os.Remove(lockPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			returnErr = errors.Join(returnErr, fmt.Errorf("remove lock file: %w", err))
+		}
+	}()
 
-	if !regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,47}$`).MatchString(options.name) {
+	if !pairNamePattern.MatchString(options.name) {
 		return "", errors.New("pair name must be 1-48 lowercase letters, digits, hyphens, or underscores")
 	}
 	if err := validateEndpoint(options.endpoint); err != nil {
@@ -422,7 +454,7 @@ func addPair(options pairOptions) (string, error) {
 	pairDirectory := filepath.Join(pairsDirectory, options.name)
 	if _, err := os.Stat(pairDirectory); err == nil {
 		return "", fmt.Errorf("pair already exists: %s", pairDirectory)
-	} else if !os.IsNotExist(err) {
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", err
 	}
 	if err := os.MkdirAll(pairsDirectory, 0700); err != nil {
@@ -432,23 +464,23 @@ func addPair(options pairOptions) (string, error) {
 		return "", err
 	}
 
-	serverPublic, err := publicKey(config.interfaceValues["PrivateKey"])
+	serverPublic, err := publicKey(ctx, config.interfaceValues["PrivateKey"])
 	if err != nil {
 		return "", err
 	}
-	radioPrivate, err := generateKey()
+	radioPrivate, err := generateKey(ctx)
 	if err != nil {
 		return "", err
 	}
-	radioPublic, err := publicKey(radioPrivate)
+	radioPublic, err := publicKey(ctx, radioPrivate)
 	if err != nil {
 		return "", err
 	}
-	modulePrivate, err := generateKey()
+	modulePrivate, err := generateKey(ctx)
 	if err != nil {
 		return "", err
 	}
-	modulePublic, err := publicKey(modulePrivate)
+	modulePublic, err := publicKey(ctx, modulePrivate)
 	if err != nil {
 		return "", err
 	}
@@ -468,23 +500,32 @@ func addPair(options pairOptions) (string, error) {
 		return "", err
 	}
 	serverTemporaryPath := serverTemporary.Name()
-	defer os.Remove(serverTemporaryPath)
+	serverTemporaryClosed := false
+	defer func() {
+		if !serverTemporaryClosed {
+			if err := serverTemporary.Close(); err != nil {
+				returnErr = errors.Join(returnErr, fmt.Errorf("close temporary server config: %w", err))
+			}
+		}
+		if err := os.Remove(serverTemporaryPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			returnErr = errors.Join(returnErr, fmt.Errorf("remove temporary server config: %w", err))
+		}
+	}()
 	if err := serverTemporary.Chmod(0600); err != nil {
-		serverTemporary.Close()
 		return "", err
 	}
 	if _, err := serverTemporary.WriteString(updatedServer); err != nil {
-		serverTemporary.Close()
 		return "", err
 	}
 	if err := serverTemporary.Sync(); err != nil {
-		serverTemporary.Close()
 		return "", err
 	}
 	if err := serverTemporary.Close(); err != nil {
+		serverTemporaryClosed = true
 		return "", err
 	}
-	if err := validateWithAWG(serverTemporaryPath); err != nil {
+	serverTemporaryClosed = true
+	if err := validateWithAWG(ctx, serverTemporaryPath); err != nil {
 		return "", fmt.Errorf("validate updated server config: %w", err)
 	}
 
@@ -492,26 +533,33 @@ func addPair(options pairOptions) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	committedPair := false
-	defer func() {
-		if !committedPair {
-			os.RemoveAll(stagingDirectory)
-		}
-	}()
 	if err := os.Chmod(stagingDirectory, 0700); err != nil {
 		return "", err
 	}
+	stagingCommitted := false
+	defer func() {
+		if !stagingCommitted {
+			if err := os.RemoveAll(stagingDirectory); err != nil {
+				returnErr = errors.Join(returnErr, fmt.Errorf("remove staged client profiles: %w", err))
+			}
+		}
+	}()
 	for filename, contents := range map[string]string{"radio.conf": radioConfig, "module.conf": moduleConfig} {
 		if err := writeAtomic(filepath.Join(stagingDirectory, filename), contents, 0600); err != nil {
 			return "", err
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if err := os.Rename(stagingDirectory, pairDirectory); err != nil {
 		return "", fmt.Errorf("publish client profiles: %w", err)
 	}
-	committedPair = true
+	stagingCommitted = true
 	if err := os.Rename(serverTemporaryPath, configPath); err != nil {
-		os.RemoveAll(pairDirectory)
+		if removeErr := os.RemoveAll(pairDirectory); removeErr != nil {
+			return "", errors.Join(fmt.Errorf("update server config: %w", err), fmt.Errorf("remove unpublished client profiles: %w", removeErr))
+		}
 		return "", fmt.Errorf("update server config: %w", err)
 	}
 	return pairDirectory, nil
@@ -523,19 +571,19 @@ func networkPrefixContains(parent, child net.IPNet) bool {
 	return parentBits == childBits && ones <= childOnes && parent.Contains(child.IP)
 }
 
-func restartIfRunning() (bool, error) {
-	containerID, err := runCommand(nil, "docker", "compose", "ps", "-q", "amneziawg")
+func restartIfRunning(ctx context.Context) (bool, error) {
+	containerID, err := runCommand(ctx, nil, "docker", "compose", "ps", "-q", "amneziawg")
 	if err != nil {
 		return false, err
 	}
 	if containerID == "" {
 		return false, nil
 	}
-	if _, err := runCommand(nil, "docker", "compose", "restart", "amneziawg"); err != nil {
+	if _, err := runCommand(ctx, nil, "docker", "compose", "restart", "amneziawg"); err != nil {
 		return false, err
 	}
 	for range 60 {
-		status, err := runCommand(nil, "docker", "inspect", "--format", "{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}", containerID)
+		status, err := runCommand(ctx, nil, "docker", "inspect", "--format", "{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}", containerID)
 		if err != nil {
 			return false, err
 		}
@@ -545,27 +593,50 @@ func restartIfRunning() (bool, error) {
 		if strings.HasPrefix(status, "exited|") || strings.HasPrefix(status, "dead|") {
 			return false, fmt.Errorf("gateway restart failed: container status %s; check docker compose logs", status)
 		}
-		time.Sleep(time.Second)
+		if strings.HasSuffix(status, "|unhealthy") {
+			return false, errors.New("gateway failed its healthcheck; check docker compose logs")
+		}
+		if err := waitForNextPoll(ctx, time.Second); err != nil {
+			return false, err
+		}
 	}
 	return false, errors.New("timed out waiting for the restarted gateway to become healthy")
 }
 
+func waitForNextPoll(ctx context.Context, interval time.Duration) error {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
 	if len(os.Args) != 5 {
 		fmt.Fprintln(os.Stderr, "Usage: go run ./cmd/add-pair <name> <radio-lan-cidr> <module-lan-cidr> <vds-endpoint:port>")
-		os.Exit(2)
+		return 2
 	}
 	radioLAN, err := parseIPv4Network(os.Args[2], "Radio LAN")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
-		os.Exit(2)
+		return 2
 	}
 	moduleLAN, err := parseIPv4Network(os.Args[3], "Module LAN")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
-		os.Exit(2)
+		return 2
 	}
-	pairPath, err := addPair(pairOptions{
+	pairPath, err := addPair(ctx, pairOptions{
 		name:      os.Args[1],
 		radioLAN:  radioLAN,
 		moduleLAN: moduleLAN,
@@ -573,21 +644,22 @@ func main() {
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
-		os.Exit(1)
+		return 1
 	}
 	fmt.Printf("Created client profiles: %s and %s\n",
 		filepath.Join(pairPath, "radio.conf"), filepath.Join(pairPath, "module.conf"))
 	fmt.Println("Each profile contains a private key; transfer it only to its matching gateway.")
 
-	restarted, err := restartIfRunning()
+	restarted, err := restartIfRunning(ctx)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Pair was added, but gateway update failed:", err)
 		fmt.Fprintln(os.Stderr, "After resolving the error, apply the config with: docker compose up -d")
-		os.Exit(1)
+		return 1
 	}
 	if restarted {
 		fmt.Println("Gateway restarted and is healthy with the new peers.")
 	} else {
 		fmt.Println("Gateway is not running. Apply the new config with: docker compose up -d")
 	}
+	return 0
 }
