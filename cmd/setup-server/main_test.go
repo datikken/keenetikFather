@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -83,6 +84,52 @@ func TestPromptServerUDPPortAcceptsBoundaries(t *testing.T) {
 				t.Fatalf("port = %d, want %d", got, testCase.want)
 			}
 		})
+	}
+}
+
+func TestPromptServerUDPPortRepromptsWhenPortIsInUse(t *testing.T) {
+	input := bufioReader("\n51821\n")
+	var output bytes.Buffer
+	checks := 0
+	port, err := promptServerUDPPortWithCheck(input, &output, 51820, func(port int) (bool, error) {
+		checks++
+		return port != 51820, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if port != 51821 {
+		t.Fatalf("port = %d, want 51821", port)
+	}
+	if checks != 2 {
+		t.Fatalf("availability checks = %d, want 2", checks)
+	}
+	if !strings.Contains(output.String(), "UDP-порт 51820 уже используется") {
+		t.Fatalf("missing occupied-port message:\n%s", output.String())
+	}
+}
+
+func TestIsUDPPortAvailableRejectsBoundPort(t *testing.T) {
+	listener, err := net.ListenPacket("udp4", "0.0.0.0:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	_, portText, err := net.SplitHostPort(listener.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	available, err := isUDPPortAvailable(port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if available {
+		t.Fatalf("UDP port %d is reported available while already bound", port)
 	}
 }
 

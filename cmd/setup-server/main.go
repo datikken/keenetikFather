@@ -179,32 +179,60 @@ func promptPublicIPv4(reader *bufio.Reader, output io.Writer) (string, error) {
 }
 
 func promptServerUDPPort(reader *bufio.Reader, output io.Writer, defaultPort int) (int, error) {
+	return promptServerUDPPortWithCheck(reader, output, defaultPort, isUDPPortAvailable)
+}
+
+func promptServerUDPPortWithCheck(reader *bufio.Reader, output io.Writer, defaultPort int, check func(int) (bool, error)) (int, error) {
 	for {
 		fmt.Fprintf(output, "UDP-порт сервера [%d]: ", defaultPort)
 		value, err := readLine(reader)
 		if err != nil {
 			return 0, err
 		}
-		if value == "" {
-			return defaultPort, nil
-		}
-		for _, character := range value {
-			if character < '0' || character > '9' {
+		port := defaultPort
+		if value != "" {
+			validDigits := true
+			for _, character := range value {
+				if character < '0' || character > '9' {
+					validDigits = false
+					break
+				}
+			}
+			if !validDigits {
 				fmt.Fprintln(output, "Введите номер UDP-порта от 1 до 65535.")
-				value = ""
-				break
+				continue
+			}
+			port, err = strconv.Atoi(value)
+			if err != nil || port < 1 || port > 65535 {
+				fmt.Fprintln(output, "Введите номер UDP-порта от 1 до 65535.")
+				continue
 			}
 		}
-		if value == "" {
-			continue
+		available, err := check(port)
+		if err != nil {
+			return 0, fmt.Errorf("проверить UDP-порт %d: %w", port, err)
 		}
-		port, err := strconv.Atoi(value)
-		if err != nil || port < 1 || port > 65535 {
-			fmt.Fprintln(output, "Введите номер UDP-порта от 1 до 65535.")
+		if !available {
+			fmt.Fprintf(output, "UDP-порт %d уже используется. Остановите использующий его сервис и введите порт снова.\n", port)
 			continue
 		}
 		return port, nil
 	}
+}
+
+func isUDPPortAvailable(port int) (bool, error) {
+	address := net.JoinHostPort("0.0.0.0", strconv.Itoa(port))
+	listener, err := net.ListenPacket("udp4", address)
+	if err != nil {
+		if isAddressInUse(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if err := listener.Close(); err != nil {
+		return false, fmt.Errorf("закрыть проверочный UDP-сокет: %w", err)
+	}
+	return true, nil
 }
 
 func isPublicIPv4(ip net.IP) bool {
