@@ -11,24 +11,26 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
 
 const (
-	defaultRadioLAN  = "192.168.66.0/24"
-	defaultModuleLAN = "192.168.55.0/24"
-	serverAddress    = "10.77.0.1/24"
-	serverListenPort = 51820
-	firstPairName    = "first"
-	imageName        = "crsf2-amneziawg:local"
-	backupDirName    = "setup-backups"
+	defaultRadioLAN      = "192.168.66.0/24"
+	defaultModuleLAN     = "192.168.55.0/24"
+	serverAddress        = "10.77.0.1/24"
+	defaultServerUDPPort = 51820
+	firstPairName        = "first"
+	imageName            = "crsf2-amneziawg:local"
+	backupDirName        = "setup-backups"
 )
 
 type setupInput struct {
-	endpoint  string
-	radioLAN  net.IPNet
-	moduleLAN net.IPNet
+	endpoint   string
+	serverPort int
+	radioLAN   net.IPNet
+	moduleLAN  net.IPNet
 }
 
 func main() {
@@ -100,7 +102,7 @@ func runSetup(ctx context.Context, input io.Reader, output io.Writer) error {
 	if !isAWGKey(serverPrivateKey) {
 		return errors.New("awg вернул некорректный ключ сервера")
 	}
-	if err := writePrivateFile(serverConfigPath, initialServerConfig(serverPrivateKey)); err != nil {
+	if err := writePrivateFile(serverConfigPath, initialServerConfig(serverPrivateKey, values.serverPort)); err != nil {
 		return fmt.Errorf("создание config/server.conf: %w", err)
 	}
 
@@ -133,6 +135,10 @@ func promptSetup(input io.Reader, output io.Writer) (setupInput, error) {
 	if err != nil {
 		return setupInput{}, err
 	}
+	serverPort, err := promptServerUDPPort(reader, output, defaultServerUDPPort)
+	if err != nil {
+		return setupInput{}, err
+	}
 	radioLAN, err := promptLAN(reader, output, "LAN Radio", defaultRadioLAN)
 	if err != nil {
 		return setupInput{}, err
@@ -149,9 +155,10 @@ func promptSetup(input io.Reader, output io.Writer) (setupInput, error) {
 		return setupInput{}, fmt.Errorf("LAN-подсети не должны пересекаться с VPN-сетью %s", vpnNetwork)
 	}
 	return setupInput{
-		endpoint:  net.JoinHostPort(endpoint, fmt.Sprint(serverListenPort)),
-		radioLAN:  radioLAN,
-		moduleLAN: moduleLAN,
+		endpoint:   net.JoinHostPort(endpoint, strconv.Itoa(serverPort)),
+		serverPort: serverPort,
+		radioLAN:   radioLAN,
+		moduleLAN:  moduleLAN,
 	}, nil
 }
 
@@ -168,6 +175,35 @@ func promptPublicIPv4(reader *bufio.Reader, output io.Writer) (string, error) {
 			continue
 		}
 		return ip.To4().String(), nil
+	}
+}
+
+func promptServerUDPPort(reader *bufio.Reader, output io.Writer, defaultPort int) (int, error) {
+	for {
+		fmt.Fprintf(output, "UDP-порт сервера [%d]: ", defaultPort)
+		value, err := readLine(reader)
+		if err != nil {
+			return 0, err
+		}
+		if value == "" {
+			return defaultPort, nil
+		}
+		for _, character := range value {
+			if character < '0' || character > '9' {
+				fmt.Fprintln(output, "Введите номер UDP-порта от 1 до 65535.")
+				value = ""
+				break
+			}
+		}
+		if value == "" {
+			continue
+		}
+		port, err := strconv.Atoi(value)
+		if err != nil || port < 1 || port > 65535 {
+			fmt.Fprintln(output, "Введите номер UDP-порта от 1 до 65535.")
+			continue
+		}
+		return port, nil
 	}
 }
 
@@ -239,7 +275,7 @@ func readLine(reader *bufio.Reader) (string, error) {
 	return strings.TrimSpace(value), nil
 }
 
-func initialServerConfig(privateKey string) string {
+func initialServerConfig(privateKey string, listenPort int) string {
 	return fmt.Sprintf(`[Interface]
 Address = %s
 ListenPort = %d
@@ -255,7 +291,7 @@ H1 = 1
 H2 = 2
 H3 = 3
 H4 = 4
-`, serverAddress, serverListenPort, privateKey)
+`, serverAddress, listenPort, privateKey)
 }
 
 func isAWGKey(value string) bool {

@@ -6,3 +6,4 @@ config/pairs/
 config/setup-backups/
 *.key
 *.private
+tmp.*

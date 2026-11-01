@@ -14,7 +14,7 @@ import (
 )
 
 func TestPromptSetupUsesDefaultLANs(t *testing.T) {
-	input := strings.NewReader("8.8.8.8\n\n\n")
+	input := strings.NewReader("8.8.8.8\n\n\n\n")
 	var output bytes.Buffer
 	values, err := promptSetup(input, &output)
 	if err != nil {
@@ -22,6 +22,9 @@ func TestPromptSetupUsesDefaultLANs(t *testing.T) {
 	}
 	if values.endpoint != "8.8.8.8:51820" {
 		t.Fatalf("endpoint = %q", values.endpoint)
+	}
+	if values.serverPort != defaultServerUDPPort {
+		t.Fatalf("serverPort = %d, want %d", values.serverPort, defaultServerUDPPort)
 	}
 	if got := values.radioLAN.String(); got != defaultRadioLAN {
 		t.Fatalf("Radio LAN = %s, want %s", got, defaultRadioLAN)
@@ -32,10 +35,13 @@ func TestPromptSetupUsesDefaultLANs(t *testing.T) {
 }
 
 func TestPromptSetupAcceptsCustomLANs(t *testing.T) {
-	input := strings.NewReader("8.8.8.8\n192.168.67.0/24\n192.168.56.0/24\n")
+	input := strings.NewReader("8.8.8.8\n51821\n192.168.67.0/24\n192.168.56.0/24\n")
 	values, err := promptSetup(input, &bytes.Buffer{})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if values.endpoint != "8.8.8.8:51821" || values.serverPort != 51821 {
+		t.Fatalf("endpoint/serverPort = %q/%d, want 8.8.8.8:51821/51821", values.endpoint, values.serverPort)
 	}
 	if got := values.radioLAN.String(); got != "192.168.67.0/24" {
 		t.Fatalf("Radio LAN = %s", got)
@@ -45,8 +51,43 @@ func TestPromptSetupAcceptsCustomLANs(t *testing.T) {
 	}
 }
 
+func TestPromptSetupRejectsInvalidUDPPorts(t *testing.T) {
+	input := strings.NewReader("8.8.8.8\nabc\n0\n65536\n51822\n\n\n")
+	var output bytes.Buffer
+	values, err := promptSetup(input, &output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if values.endpoint != "8.8.8.8:51822" {
+		t.Fatalf("endpoint = %q, want 8.8.8.8:51822", values.endpoint)
+	}
+	if strings.Count(output.String(), "Введите номер UDP-порта от 1 до 65535.") != 3 {
+		t.Fatal("expected invalid ports to produce validation messages")
+	}
+}
+
+func TestPromptServerUDPPortAcceptsBoundaries(t *testing.T) {
+	for _, testCase := range []struct {
+		input string
+		want  int
+	}{
+		{input: "1", want: 1},
+		{input: "65535", want: 65535},
+	} {
+		t.Run(testCase.input, func(t *testing.T) {
+			got, err := promptServerUDPPort(bufioReader(testCase.input+"\n"), &bytes.Buffer{}, defaultServerUDPPort)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != testCase.want {
+				t.Fatalf("port = %d, want %d", got, testCase.want)
+			}
+		})
+	}
+}
+
 func TestPromptSetupRejectsPrivatePublicEndpoint(t *testing.T) {
-	input := strings.NewReader("192.168.1.10\n8.8.8.8\n\n\n")
+	input := strings.NewReader("192.168.1.10\n8.8.8.8\n\n\n\n")
 	var output bytes.Buffer
 	_, err := promptSetup(input, &output)
 	if err != nil {
@@ -58,7 +99,7 @@ func TestPromptSetupRejectsPrivatePublicEndpoint(t *testing.T) {
 }
 
 func TestPromptSetupRejectsOverlappingLANs(t *testing.T) {
-	input := strings.NewReader("8.8.8.8\n192.168.66.0/24\n192.168.66.128/25\n")
+	input := strings.NewReader("8.8.8.8\n\n192.168.66.0/24\n192.168.66.128/25\n")
 	if _, err := promptSetup(input, &bytes.Buffer{}); err == nil {
 		t.Fatal("expected overlapping LANs to be rejected")
 	}
@@ -205,6 +246,13 @@ func TestWaitForNextPollReturnsWhenContextIsCanceled(t *testing.T) {
 
 	if err := waitForNextPoll(ctx, time.Hour); !errors.Is(err, context.Canceled) {
 		t.Fatalf("waitForNextPoll error = %v, want %v", err, context.Canceled)
+	}
+}
+
+func TestInitialServerConfigUsesSelectedUDPPort(t *testing.T) {
+	config := initialServerConfig("private-key", 51823)
+	if !strings.Contains(config, "ListenPort = 51823") {
+		t.Fatalf("server config missing selected listen port:\n%s", config)
 	}
 }
 
