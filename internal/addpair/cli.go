@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+
+	"crsf2/internal/awgservice"
 )
 
 // Run validates command arguments, adds one Radio/Module pair, and updates the gateway.
@@ -45,16 +47,16 @@ func Run(ctx context.Context, args []string, output, errorOutput io.Writer) int 
 		filepath.Join(pairPath, "radio.conf"), filepath.Join(pairPath, "module.conf"))
 	fmt.Fprintln(output, "Each profile contains a private key; transfer it only to its matching gateway.")
 
-	restarted, err := newGatewayManager(root).restartIfRunning(ctx)
+	restarted, err := awgservice.New(root).RestartIfActive(ctx, output)
 	if err != nil {
 		fmt.Fprintln(errorOutput, "Pair was added, but gateway update failed:", err)
-		fmt.Fprintln(errorOutput, "After resolving the error, apply the config with: docker compose up -d")
+		fmt.Fprintln(errorOutput, "After resolving the error, apply the config with: sudo systemctl restart crsf2-amneziawg")
 		return 1
 	}
 	if restarted {
 		fmt.Fprintln(output, "Gateway restarted and is healthy with the new peers.")
 	} else {
-		fmt.Fprintln(output, "Gateway is not running. Apply the new config with: docker compose up -d")
+		fmt.Fprintln(output, "Gateway is not running. Deploy or start it with: sudo go run ./cmd/deploy-server")
 	}
 	return 0
 }

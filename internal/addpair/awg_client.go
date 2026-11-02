@@ -11,8 +11,6 @@ import (
 	"strings"
 )
 
-const imageName = "crsf2-amneziawg:local"
-
 var awgKeyPattern = regexp.MustCompile(`^[A-Za-z0-9+/]{43}=$`)
 
 type commandRunner struct {
@@ -41,19 +39,14 @@ func (runner commandRunner) run(ctx context.Context, input []byte, name string, 
 
 type awgClient struct {
 	commands commandRunner
-	image    string
 }
 
 func newAWGClient(root string) awgClient {
-	return awgClient{
-		commands: commandRunner{root: root},
-		image:    imageName,
-	}
+	return awgClient{commands: commandRunner{root: root}}
 }
 
 func (client awgClient) generateKey(ctx context.Context) (string, error) {
-	key, err := client.commands.run(ctx, nil, "docker", "compose", "run", "--rm", "--no-deps", "-T",
-		"--entrypoint", "awg", "amneziawg", "genkey")
+	key, err := client.commands.run(ctx, nil, "awg", "genkey")
 	if err != nil {
 		return "", err
 	}
@@ -64,8 +57,7 @@ func (client awgClient) generateKey(ctx context.Context) (string, error) {
 }
 
 func (client awgClient) publicKey(ctx context.Context, privateKey string) (string, error) {
-	key, err := client.commands.run(ctx, []byte(privateKey+"\n"), "docker", "compose", "run", "--rm", "--no-deps", "-T",
-		"--entrypoint", "awg", "amneziawg", "pubkey")
+	key, err := client.commands.run(ctx, []byte(privateKey+"\n"), "awg", "pubkey")
 	if err != nil {
 		return "", err
 	}
@@ -80,8 +72,6 @@ func (client awgClient) validateConfig(ctx context.Context, configPath string) e
 	if err != nil {
 		return fmt.Errorf("resolve config path: %w", err)
 	}
-	_, err = client.commands.run(ctx, nil, "docker", "run", "--rm", "--network", "none",
-		"--mount", fmt.Sprintf("type=bind,source=%s,target=/tmp/server.conf,readonly", absolute),
-		"--entrypoint", "bash", client.image, "-lc", "awg-quick strip /tmp/server.conf")
+	_, err = client.commands.run(ctx, nil, "awg-quick", "strip", absolute)
 	return err
 }

@@ -1,33 +1,38 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-interface="${AWG_INTERFACE:-awg0}"
-config="${AWG_CONFIG_FILE:-/etc/amnezia/amneziawg/awg0.conf}"
-address="${AWG_ADDRESS:-10.77.0.1/24}"
-socket="/run/amneziawg/${interface}.sock"
+readonly interface="awg0"
+readonly config="${AWG_CONFIG_FILE:-}"
+readonly socket="/run/amneziawg/${interface}.sock"
 awg_pid=""
 interface_created=false
 route_added=()
 
-if [[ ! -r "$config" ]]; then
-    printf 'AmneziaWG config is missing or unreadable: %s\n' "$config" >&2
+fail() {
+    printf 'ERROR: %s\n' "$*" >&2
     exit 1
-fi
+}
 
-if grep -Eq 'CHANGE_ME|REPLACE_WITH_' "$config"; then
-    printf 'Replace the placeholder values in %s before starting the gateway.\n' "$config" >&2
-    exit 1
-fi
-
-if [[ "$(cat /proc/sys/net/ipv4/ip_forward)" != "1" ]]; then
-    printf 'IPv4 forwarding is disabled on the VDS host. Enable net.ipv4.ip_forward=1 before starting.\n' >&2
-    exit 1
-fi
-
+[[ -n "$config" && -r "$config" ]] || fail "AWG_CONFIG_FILE is missing or unreadable: $config"
+grep -Eq 'CHANGE_ME|REPLACE_WITH_' "$config" && fail "Replace all placeholders in $config."
+[[ "$(cat /proc/sys/net/ipv4/ip_forward)" == "1" ]] || fail "Enable net.ipv4.ip_forward=1."
+[[ -c /dev/net/tun ]] || fail "/dev/net/tun is unavailable; load the Linux tun module."
 if ip link show dev "$interface" >/dev/null 2>&1; then
-    printf 'Interface %s already exists on the VDS host; refusing to replace it.\n' "$interface" >&2
-    exit 1
+    fail "Interface $interface already exists; refusing to replace it."
 fi
+
+address="$(awk '
+    /^\[Interface\]/ { in_interface = 1; next }
+    /^\[/ { in_interface = 0 }
+    in_interface && /^[[:space:]]*Address[[:space:]]*=/ {
+        sub(/^[^=]*=[[:space:]]*/, "")
+        sub(/[[:space:]]*#.*/, "")
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+        print
+        exit
+    }
+' "$config")"
+[[ -n "$address" ]] || fail "No Address found in the [Interface] section of $config."
 
 mkdir -p /run/amneziawg
 
@@ -41,12 +46,10 @@ cleanup() {
     if [[ "$interface_created" == true ]]; then
         ip link del dev "$interface" 2>/dev/null || true
     fi
-
     if [[ -n "$awg_pid" ]] && kill -0 "$awg_pid" 2>/dev/null; then
         kill "$awg_pid" 2>/dev/null || true
         wait "$awg_pid" 2>/dev/null || true
     fi
-
     exit "$exit_code"
 }
 trap cleanup EXIT
@@ -61,16 +64,11 @@ for ((attempt = 0; attempt < 100; attempt++)); do
     fi
     if ! kill -0 "$awg_pid" 2>/dev/null; then
         wait "$awg_pid"
-        printf 'AmneziaWG userspace interface exited before its control socket became ready.\n' >&2
-        exit 1
+        fail "AmneziaWG userspace process exited before its control socket became ready."
     fi
     sleep 0.1
 done
-
-if [[ ! -S "$socket" ]]; then
-    printf 'Timed out waiting for the AmneziaWG control socket: %s\n' "$socket" >&2
-    exit 1
-fi
+[[ -S "$socket" ]] || fail "Timed out waiting for AmneziaWG control socket $socket."
 
 interface_created=true
 awg setconf "$interface" <(awg-quick strip "$config")
@@ -96,6 +94,5 @@ done < <(
     ' "$config" | sort -u
 )
 
-printf 'AmneziaWG gateway is ready on %s; routes installed for all peer AllowedIPs.\n' "$interface"
-
+printf 'AmneziaWG is ready on %s; routes installed for all peer AllowedIPs.\n' "$interface"
 wait "$awg_pid"

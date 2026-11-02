@@ -11,7 +11,6 @@ const (
 	serverAddress        = "10.77.0.1/24"
 	defaultServerUDPPort = 51820
 	firstPairName        = "first"
-	imageName            = "crsf2-amneziawg:local"
 	backupDirName        = "setup-backups"
 )
 

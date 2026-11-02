@@ -7,7 +7,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
+
+	"crsf2/internal/awgservice"
 )
 
 type setupWizard struct {
@@ -15,7 +18,7 @@ type setupWizard struct {
 	root     string
 	input    io.Reader
 	output   io.Writer
-	compose  composeClient
+	service  awgservice.Manager
 	commands commandRunner
 }
 
@@ -25,14 +28,17 @@ func newSetupWizard(ctx context.Context, root string, input io.Reader, output io
 		root:     root,
 		input:    input,
 		output:   output,
-		compose:  newComposeClient(root),
+		service:  awgservice.New(root),
 		commands: commandRunner{root: root},
 	}
 }
 
 func (wizard setupWizard) run() error {
-	if _, err := os.Stat(filepath.Join(wizard.root, "compose.yaml")); err != nil {
-		return fmt.Errorf("запустите команду из каталога проекта (compose.yaml не найден): %w", err)
+	if runtime.GOOS != "linux" {
+		return errors.New("настройку сервера нужно запускать непосредственно на Linux VDS")
+	}
+	if _, err := os.Stat(filepath.Join(wizard.root, "scripts", "install-amneziawg.sh")); err != nil {
+		return fmt.Errorf("запустите команду из каталога проекта (installer не найден): %w", err)
 	}
 
 	lockPath := filepath.Join(wizard.root, "config", ".add-pair.lock")
@@ -48,13 +54,14 @@ func (wizard setupWizard) run() error {
 	if err != nil {
 		return err
 	}
-	if err := wizard.compose.build(wizard.ctx, wizard.output); err != nil {
-		return fmt.Errorf("сборка Docker-образа: %w", err)
+	fmt.Fprintln(wizard.output, "\nУстанавливаю AmneziaWG непосредственно на VDS...")
+	if err := wizard.service.Install(wizard.ctx, wizard.output); err != nil {
+		return fmt.Errorf("установка AmneziaWG: %w", err)
 	}
 	if err := wizard.ctx.Err(); err != nil {
 		return err
 	}
-	if err := wizard.compose.stopIfRunning(wizard.ctx, wizard.output); err != nil {
+	if err := wizard.service.StopIfActive(wizard.ctx, wizard.output); err != nil {
 		return fmt.Errorf("остановка существующего сервера: %w", err)
 	}
 
@@ -68,8 +75,7 @@ func (wizard setupWizard) run() error {
 	}
 
 	fmt.Fprintln(wizard.output, "\nСоздаю ключ сервера...")
-	serverPrivateKey, err := wizard.commands.output(wizard.ctx, "docker", "run", "--rm", "--network", "none",
-		"--entrypoint", "awg", imageName, "genkey")
+	serverPrivateKey, err := wizard.commands.output(wizard.ctx, "awg", "genkey")
 	if err != nil {
 		return fmt.Errorf("генерация ключа сервера: %w", err)
 	}
@@ -88,14 +94,11 @@ func (wizard setupWizard) run() error {
 	}
 
 	fmt.Fprintln(wizard.output, "\nЗапускаю сервер...")
-	if err := wizard.compose.runServer(wizard.ctx, wizard.output); err != nil {
+	if err := wizard.service.StartAndWait(wizard.ctx, wizard.output); err != nil {
 		return fmt.Errorf("запуск сервера: %w", err)
 	}
-	if err := wizard.compose.waitUntilHealthy(wizard.ctx); err != nil {
-		return err
-	}
 
-	fmt.Fprintln(wizard.output, "\nСервер запущен и прошёл healthcheck.")
+	fmt.Fprintln(wizard.output, "\nСервер запущен как systemd-служба.")
 	fmt.Fprintf(wizard.output, "Radio LAN:  %s\n", values.radioLAN.String())
 	fmt.Fprintf(wizard.output, "Module LAN: %s\n", values.moduleLAN.String())
 	fmt.Fprintf(wizard.output, "Публичный endpoint: %s\n", values.endpoint)
