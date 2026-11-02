@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -67,11 +68,36 @@ func (client awgClient) publicKey(ctx context.Context, privateKey string) (strin
 	return key, nil
 }
 
-func (client awgClient) validateConfig(ctx context.Context, configPath string) error {
-	absolute, err := filepath.Abs(configPath)
+func (client awgClient) validateConfig(ctx context.Context, configPath string) (returnErr error) {
+	stagedPath, cleanup, err := stageConfigForValidation(configPath)
 	if err != nil {
-		return fmt.Errorf("resolve config path: %w", err)
+		return err
 	}
-	_, err = client.commands.run(ctx, nil, "awg-quick", "strip", absolute)
-	return err
+	defer func() {
+		if err := cleanup(); err != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("remove staged validation config: %w", err))
+		}
+	}()
+	_, returnErr = client.commands.run(ctx, nil, "awg-quick", "strip", stagedPath)
+	return returnErr
+}
+
+func stageConfigForValidation(configPath string) (string, func() error, error) {
+	config, err := os.ReadFile(configPath)
+	if err != nil {
+		return "", nil, fmt.Errorf("read config for validation: %w", err)
+	}
+	directory, err := os.MkdirTemp("", "crsf2-awg-validation-*")
+	if err != nil {
+		return "", nil, fmt.Errorf("create validation directory: %w", err)
+	}
+	path := filepath.Join(directory, "awg0.conf")
+	if err := os.WriteFile(path, config, 0600); err != nil {
+		if cleanupErr := os.RemoveAll(directory); cleanupErr != nil {
+			return "", nil, errors.Join(fmt.Errorf("write validation config: %w", err),
+				fmt.Errorf("remove validation directory: %w", cleanupErr))
+		}
+		return "", nil, fmt.Errorf("write validation config: %w", err)
+	}
+	return path, func() error { return os.RemoveAll(directory) }, nil
 }

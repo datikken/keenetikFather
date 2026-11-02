@@ -3,6 +3,8 @@ package addpair
 import (
 	"context"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -97,6 +99,34 @@ func TestClientProfileIncludesPeerRouteAndParameters(t *testing.T) {
 		if !strings.Contains(profile, expected) {
 			t.Errorf("profile missing %q:\n%s", expected, profile)
 		}
+	}
+}
+
+func TestStageConfigForValidationUsesAWGInterfaceFilename(t *testing.T) {
+	sourcePath := filepath.Join(t.TempDir(), ".server.conf-temporary")
+	const configContents = "[Interface]\nAddress = 10.77.0.1/24\nPrivateKey = private\n"
+	if err := os.WriteFile(sourcePath, []byte(configContents), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	stagedPath, cleanup, err := stageConfigForValidation(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := cleanup(); err != nil {
+			t.Errorf("cleanup validation config: %v", err)
+		}
+	}()
+	if filepath.Base(stagedPath) != "awg0.conf" {
+		t.Fatalf("staged filename = %q, want awg0.conf", filepath.Base(stagedPath))
+	}
+	stagedContents, err := os.ReadFile(stagedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(stagedContents) != configContents {
+		t.Fatalf("staged config = %q, want %q", stagedContents, configContents)
 	}
 }
 
